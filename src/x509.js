@@ -124,25 +124,59 @@ function parseNameConstraints(bytes) {
   return { permitted, excluded };
 }
 
+// AuthorityKeyIdentifier ::= SEQUENCE {
+//   keyIdentifier             [0] KeyIdentifier OPTIONAL,
+//   authorityCertIssuer       [1] GeneralNames OPTIONAL（EXPLICIT）,
+//   authorityCertSerialNumber [2] CertificateSerialNumber OPTIONAL }
+// 返回 { keyId, certIssuer, certSerial }：
+//   keyId      —— keyIdentifier 原始字节，或 null
+//   certIssuer —— 签发者 directoryName 的完整 Name TLV 字节，或 null
+//   certSerial —— 签发者证书序列号（INTEGER 内容字节的 hex，含符号填充），或 null
 function parseAuthorityKeyIdentifier(bytes) {
   const el = readElement(bytes, 0);
   expect(el, 0, 16, 'AuthorityKeyIdentifier SEQUENCE');
   if (el.next !== bytes.length) throw new DerError('AuthorityKeyIdentifier 存在尾随字节');
   let keyId = null;
+  let certIssuer = null;
+  let certSerial = null;
+  let lastTag = -1;
   for (const field of children(el)) {
-    if (field.tagClass !== 2) throw new DerError('AuthorityKeyIdentifier 含未知字段');
+    if (field.tagClass !== 2 || field.tag < 0 || field.tag > 2) {
+      throw new DerError('AuthorityKeyIdentifier 含未知字段');
+    }
+    if (field.tag <= lastTag) throw new DerError('AuthorityKeyIdentifier 字段顺序非法');
+    lastTag = field.tag;
     if (field.tag === 0) {
       if (keyId !== null || field.value.length === 0) {
         throw new DerError('AuthorityKeyIdentifier 的 keyIdentifier 非法');
       }
       keyId = field.value.slice();
-      continue;
-    }
-    if (field.tag !== 1 && field.tag !== 2) {
-      throw new DerError('AuthorityKeyIdentifier 含未知字段');
+    } else if (field.tag === 1) {
+      // [1] EXPLICIT GeneralNames
+      const gns = readElement(field.value, 0);
+      expect(gns, 0, 16, 'AuthorityKeyIdentifier 的 GeneralNames');
+      if (gns.next !== field.value.length) {
+        throw new DerError('AuthorityKeyIdentifier 的 GeneralNames 存在尾随字节');
+      }
+      for (const gn of children(gns)) {
+        if (gn.tagClass === 2 && gn.tag === 4) { // directoryName [4] EXPLICIT Name
+          const nameEl = readElement(gn.value, 0);
+          expect(nameEl, 0, 16, 'AuthorityKeyIdentifier 的 directoryName');
+          if (nameEl.next !== gn.value.length) {
+            throw new DerError('AuthorityKeyIdentifier 的 directoryName 存在尾随字节');
+          }
+          certIssuer = nameEl.raw;
+        }
+        // 其余 GeneralName 形式（rfc822Name / URI 等）与签发者定位无关，忽略
+      }
+    } else {
+      if (field.value.length === 0) {
+        throw new DerError('AuthorityKeyIdentifier 的 authorityCertSerialNumber 为空');
+      }
+      certSerial = toHex(field.value);
     }
   }
-  return keyId;
+  return { keyId, certIssuer, certSerial };
 }
 
 function parseSubjectKeyIdentifier(bytes) {
@@ -161,8 +195,10 @@ function parseExtensions(el) {
     san: null,              // {dns: [], critical}
     nameConstraints: null,  // {permitted: [], excluded: [], critical}
     subjectKeyIdentifier: null,
-    authorityKeyIdentifier: null,
     authorityKeyIdentifierPresent: false,
+    authorityKeyIdentifier: null, // keyIdentifier 字节，或 null
+    authorityCertIssuer: null,    // 签发者 Name 原始字节，或 null
+    authorityCertSerial: null,    // 签发者序列号 hex，或 null
     unknownCritical: [],
   };
   for (const extnEl of children(el)) {
@@ -195,10 +231,14 @@ function parseExtensions(el) {
       case OID.ski:
         ext.subjectKeyIdentifier = parseSubjectKeyIdentifier(v);
         break;
-      case OID.aki:
-        ext.authorityKeyIdentifier = parseAuthorityKeyIdentifier(v);
+      case OID.aki: {
+        const aki = parseAuthorityKeyIdentifier(v);
         ext.authorityKeyIdentifierPresent = true;
+        ext.authorityKeyIdentifier = aki.keyId;
+        ext.authorityCertIssuer = aki.certIssuer;
+        ext.authorityCertSerial = aki.certSerial;
         break;
+      }
       default:
         if (critical && !IGNORED_KNOWN.has(oid)) ext.unknownCritical.push(oid);
     }
@@ -287,8 +327,10 @@ export function parseCertificate(derBytes) {
 
     let extensions = {
       basicConstraints: null, keyUsage: null, san: null,
-      nameConstraints: null, subjectKeyIdentifier: null, authorityKeyIdentifier: null,
-      authorityKeyIdentifierPresent: false, unknownCritical: [],
+      nameConstraints: null, subjectKeyIdentifier: null,
+      authorityKeyIdentifierPresent: false, authorityKeyIdentifier: null,
+      authorityCertIssuer: null, authorityCertSerial: null,
+      unknownCritical: [],
     };
     if (i < t.length) {
       if (t[i].tagClass !== 2 || t[i].tag !== 3) throw new DerError('TBSCertificate 含未知字段');
@@ -330,8 +372,10 @@ export function parseCertificate(derBytes) {
       sanDns: extensions.san ? extensions.san.dns : [],
       nameConstraints: extensions.nameConstraints || { permitted: [], excluded: [] },
       subjectKeyIdentifier: extensions.subjectKeyIdentifier,
-      authorityKeyIdentifier: extensions.authorityKeyIdentifier,
       authorityKeyIdentifierPresent: extensions.authorityKeyIdentifierPresent,
+      authorityKeyIdentifier: extensions.authorityKeyIdentifier,
+      authorityCertIssuer: extensions.authorityCertIssuer,
+      authorityCertSerial: extensions.authorityCertSerial,
       label: '',
       sha256: '',
     };

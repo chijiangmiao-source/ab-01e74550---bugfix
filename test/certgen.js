@@ -1,6 +1,6 @@
 // certgen.js — 测试夹具：最小 DER 编码器 + P-256 ECDSA/SHA-256 证书构造器。
 // 仅用于测试，生成与被测解析器/验证器相对应的真实签名证书。
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 
 // ---------- DER 编码 ----------
 
@@ -69,6 +69,29 @@ export const UTF8 = (s) => tlv(0x0c, te.encode(s));
 export const EXPL = (n, ...c) => tlv(0xa0 + n, ...c);
 export const DNSNAME = (s) => tlv(0x82, te.encode(s)); // dNSName [2] IA5String（IMPLICIT）
 
+// SubjectKeyIdentifier 扩展值：OCTET STRING(KeyIdentifier)
+export const skiValue = (id) => OCT(id);
+
+// AuthorityKeyIdentifier 扩展值。
+//   { keyId }                  → 仅 keyIdentifier [0]
+//   { issuerCN, serial }       → authorityCertIssuer [1]（directoryName）+ serialNumber [2]
+//   { keyId, issuerCN, serial} → 三者并存
+export function akiValue({ keyId = null, issuerCN = null, serial = null } = {}) {
+  const parts = [];
+  if (keyId) parts.push(tlv(0x80, keyId));
+  if (issuerCN != null) {
+    const dirName = tlv(0xa4, NAME(issuerCN)); // directoryName [4] EXPLICIT Name
+    parts.push(tlv(0xa1, SEQ(dirName)));      // authorityCertIssuer [1] EXPLICIT
+  }
+  if (serial != null) {
+    const si = INT(serial);
+    // INT(serial) = 0x02 <length> <content>；取其内容字节
+    const nLen = si[1] & 0x80 ? (si[1] & 0x7f) : 0;
+    parts.push(tlv(0x82, si.subarray(2 + nLen))); // [2] 证书序列号（INTEGER 内容字节）
+  }
+  return SEQ(...parts);
+}
+
 const p2 = (n) => String(n).padStart(2, '0');
 const fmtUtc = (d) =>
   `${p2(d.getUTCFullYear() % 100)}${p2(d.getUTCMonth() + 1)}${p2(d.getUTCDate())}` +
@@ -114,13 +137,20 @@ export function makeCert(opts) {
     notBefore = new Date('2026-01-01T00:00:00Z'),
     notAfter = new Date('2027-01-01T00:00:00Z'),
     serial = 1,
+    ski = null,        // SubjectKeyIdentifier：Uint8Array（或 true 取公钥 SHA-256 前 20 字节）
+    aki = null,        // AuthorityKeyIdentifier：akiValue(...) 的扩展值 DER
     extraExtensions = [],
     tamperSig = false,
   } = opts;
 
   const spki = new Uint8Array(subjectPubKey.export({ format: 'der', type: 'spki' }));
 
+  let skiId = ski;
+  if (skiId === true) skiId = createHash('sha256').update(spki).digest().subarray(0, 20);
+
   const exts = [];
+  if (skiId) exts.push(extn('2.5.29.14', false, skiValue(skiId)));
+  if (aki) exts.push(extn('2.5.29.35', false, aki));
   if (isCA) {
     const bc = [BOOL(true)];
     if (pathLen !== null) bc.push(INT(pathLen));

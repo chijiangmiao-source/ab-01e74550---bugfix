@@ -237,21 +237,67 @@ export async function verifyChainSet({ anchorDer, certDers, dnsName, verifyTime 
   }
 
   // —— 构造候选链（叶 → 锚，DFS，检测循环签发）
+  // 签发者定位（RFC 5280 §4.2.1.1 / RFC 4158）：
+  //   1) AKI 含 keyIdentifier → 名称匹配 + SKI 匹配；
+  //   2) AKI 含 authorityCertIssuer + serialNumber → 名称 + 序列号匹配；
+  //   3) 无签发者标识 → 仅按名称取同名候选，交由逐级签名核验裁决。
+  // 信任锚经 anchorMatchesAki 单独参与定位（不放入池索引，避免与同名池证书重复）。
   const bySubject = new Map();
   const bySubjectKeyId = new Map();
+  const bySubjectSerial = new Map();
+  const addIndex = (map, k, c) => {
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(c);
+  };
   for (const c of uniq) {
     const k = toHex(c.subject.der);
-    if (!bySubject.has(k)) bySubject.set(k, []);
-    bySubject.get(k).push(c);
-    if (c.subjectKeyIdentifier) {
-      const keyId = `${k}|${toHex(c.subjectKeyIdentifier)}`;
-      if (!bySubjectKeyId.has(keyId)) bySubjectKeyId.set(keyId, []);
-      bySubjectKeyId.get(keyId).push(c);
-    }
+    addIndex(bySubject, k, c);
+    if (c.subjectKeyIdentifier) addIndex(bySubjectKeyId, `${k}|${toHex(c.subjectKeyIdentifier)}`, c);
+    addIndex(bySubjectSerial, `${k}|${c.serial}`, c);
   }
-  for (const list of bySubject.values()) list.sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
-  for (const list of bySubjectKeyId.values()) list.sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
-  const anchorKey = toHex(anchor.subject.der);
+  for (const map of [bySubject, bySubjectKeyId, bySubjectSerial]) {
+    for (const list of map.values()) list.sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
+  }
+
+  const anchorSubjectKey = toHex(anchor.subject.der);
+  const anchorKeyId = anchor.subjectKeyIdentifier ? toHex(anchor.subjectKeyIdentifier) : null;
+
+  // 信任锚是否满足证书上的签发者标识（不匹配时不得把锚作为候选）。
+  const anchorMatchesAki = (cur, issKey) => {
+    if (issKey !== anchorSubjectKey) return false;
+    if (cur.authorityKeyIdentifier) {
+      // 锚声明了 SKI 时须逐字节一致；锚未声明 SKI 则无法按密钥标识比对，
+      // 沿用“按名称直达信任锚、签名最终裁决”的策略。
+      return anchorKeyId === null || anchorKeyId === toHex(cur.authorityKeyIdentifier);
+    }
+    if (cur.authorityCertIssuer && cur.authorityCertSerial) {
+      return toHex(cur.authorityCertIssuer) === issKey && anchor.serial === cur.authorityCertSerial;
+    }
+    return true; // 无签发者标识：名称相同即可，签名最终裁决
+  };
+
+  // 按证书上的签发者标识挑选候选签发者；返回空数组表示标识无匹配。
+  const pickIssuers = (cur) => {
+    const issKey = toHex(cur.issuer.der);
+    let list;
+    if (cur.authorityKeyIdentifier) {
+      list = bySubjectKeyId.get(`${issKey}|${toHex(cur.authorityKeyIdentifier)}`) || [];
+    } else if (cur.authorityCertIssuer && cur.authorityCertSerial) {
+      // AKI 的 authorityCertIssuer 必须与 issuer 字段同名，序列号须逐字节一致。
+      list = toHex(cur.authorityCertIssuer) === issKey
+        ? (bySubjectSerial.get(`${issKey}|${cur.authorityCertSerial}`) || [])
+        : [];
+    } else {
+      list = bySubject.get(issKey) || [];
+    }
+    // 信任锚按配置直接信任，但同样要通过签发者标识核验；
+    // 是否成立最终仍由逐级签名核验裁决。
+    if (anchorMatchesAki(cur, issKey) && !list.includes(anchor)) {
+      list = [...list, anchor].sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
+    }
+    return list;
+  };
+
   const maxDepth = uniq.length + 1;
   const candidates = [];
   const buildErrors = [];
@@ -259,21 +305,18 @@ export async function verifyChainSet({ anchorDer, certDers, dnsName, verifyTime 
     const path = [leaf];
     const inPath = new Set([leaf.sha256]);
     const dfs = (cur) => {
-      const issKey = toHex(cur.issuer.der);
-      if (issKey === anchorKey) {
-        candidates.push([...path, anchor]);
+      if (cur === anchor) {
+        candidates.push([...path]);
         return;
       }
-      const issuerKey = cur.authorityKeyIdentifier
-        ? `${issKey}|${toHex(cur.authorityKeyIdentifier)}`
-        : null;
-      const issuers = cur.authorityKeyIdentifierPresent
-        ? (bySubjectKeyId.get(issuerKey) || [])
-        : (bySubject.get(issKey) || []);
+      const issuers = pickIssuers(cur);
       if (issuers.length === 0) {
-        const akiDetail = cur.authorityKeyIdentifierPresent
-          ? '，AuthorityKeyIdentifier 未匹配到候选签发者'
-          : '';
+        let akiDetail = '';
+        if (cur.authorityKeyIdentifier) {
+          akiDetail = '，AuthorityKeyIdentifier 的 keyIdentifier 未匹配到候选签发者';
+        } else if (cur.authorityCertIssuer || cur.authorityCertSerial) {
+          akiDetail = '，AuthorityKeyIdentifier 携带的签发者名称/序列号未匹配到候选签发者';
+        }
         buildErrors.push({
           stage: 'chain', label: cur.label,
           message: `找不到 “${cur.issuer.str}” 的签发者证书${akiDetail}，链路无法到达信任锚`,
