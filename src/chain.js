@@ -155,6 +155,15 @@ async function verifyOneChain(chain, host, at) {
 
     if (!isAnchor) {
       const issuer = chain[i + 1];
+      if (c.authorityKeyIdentifierPresent) {
+        const aki = c.authorityKeyIdentifier;
+        const ways = [];
+        if (aki.keyIdentifier) ways.push('密钥标识');
+        if (aki.issuerNames.length > 0 || aki.serial) ways.push('签发者名称+序列号');
+        notes[i].push(`AuthorityKeyIdentifier（${ways.join('、')}）与 L${i + 1}（${issuer.subject.str}）匹配`);
+      } else {
+        notes[i].push('无 AuthorityKeyIdentifier：按签发者名称候选并以签名核验确定签发者');
+      }
       if (!(await verifySignature(issuer, c))) {
         return failAt('signature', i,
           `签名验证失败：签发者 ${issuer.label}（${issuer.subject.str}）的公钥无法验证该证书`);
@@ -237,9 +246,12 @@ export async function verifyChainSet({ anchorDer, certDers, dnsName, verifyTime 
   }
 
   // —— 构造候选链（叶 → 锚，DFS，检测循环签发）
+  // 签发者索引（均按 DER 字节精确匹配）：
+  //   bySubject：主体名称 → 候选签发者（含信任锚）
+  //   bySubjectKeyId：主体名称 + SubjectKeyIdentifier → 候选
   const bySubject = new Map();
   const bySubjectKeyId = new Map();
-  for (const c of uniq) {
+  const indexCert = (c) => {
     const k = toHex(c.subject.der);
     if (!bySubject.has(k)) bySubject.set(k, []);
     bySubject.get(k).push(c);
@@ -248,9 +260,45 @@ export async function verifyChainSet({ anchorDer, certDers, dnsName, verifyTime 
       if (!bySubjectKeyId.has(keyId)) bySubjectKeyId.set(keyId, []);
       bySubjectKeyId.get(keyId).push(c);
     }
-  }
+  };
+  for (const c of uniq) indexCert(c);
+  indexCert(anchor);
   for (const list of bySubject.values()) list.sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
   for (const list of bySubjectKeyId.values()) list.sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
+
+  // 按证书上的签发者标识定位候选签发者。RFC 5280 §4.2.1.1：
+  // AKI 可携带 keyIdentifier、签发者名称（GeneralNames 中的 directoryName）与序列号；
+  // 名称始终必须匹配，存在的标识字段必须与候选证书逐一吻合。
+  const findIssuers = (cur) => {
+    const issKey = toHex(cur.issuer.der);
+    const aki = cur.authorityKeyIdentifierPresent ? cur.authorityKeyIdentifier : null;
+    let candidates = bySubject.get(issKey) || [];
+
+    if (aki && aki.keyIdentifier) {
+      candidates = (bySubjectKeyId.get(`${issKey}|${toHex(aki.keyIdentifier)}`) || [])
+        .filter((c) => candidates.includes(c));
+    }
+    if (aki && aki.issuerNames.length > 0) {
+      const nameSet = new Set(aki.issuerNames.map((n) => toHex(n)));
+      candidates = candidates.filter((c) => nameSet.has(toHex(c.subject.der)));
+    }
+    if (aki && aki.serial) {
+      const serialHex = toHex(aki.serial);
+      candidates = candidates.filter((c) => c.serial === serialHex);
+    }
+    return candidates;
+  };
+
+  // 找不到签发者时的人类可读说明。
+  const issuerMismatchDetail = (cur) => {
+    if (!cur.authorityKeyIdentifierPresent) return '';
+    const aki = cur.authorityKeyIdentifier;
+    const parts = [];
+    if (aki.keyIdentifier) parts.push('密钥标识');
+    if (aki.issuerNames.length > 0 || aki.serial) parts.push('签发者名称+序列号');
+    return parts.length > 0 ? `，AuthorityKeyIdentifier（${parts.join('、')}）未匹配到候选签发者` : '';
+  };
+
   const anchorKey = toHex(anchor.subject.der);
   const maxDepth = uniq.length + 1;
   const candidates = [];
@@ -260,23 +308,26 @@ export async function verifyChainSet({ anchorDer, certDers, dnsName, verifyTime 
     const inPath = new Set([leaf.sha256]);
     const dfs = (cur) => {
       const issKey = toHex(cur.issuer.der);
+      const matches = findIssuers(cur);
       if (issKey === anchorKey) {
-        candidates.push([...path, anchor]);
-        return;
+        // 名称指向信任锚：标识（密钥标识/序列号）也吻合时，叶→锚候选成立；
+        // 同名的池中候选仍继续向下 DFS，不漏掉“锚同名证书”场景。
+        if (matches.includes(anchor)) candidates.push([...path, anchor]);
+        if (!matches.some((c) => c !== anchor)) {
+          if (!matches.includes(anchor)) {
+            buildErrors.push({
+              stage: 'chain', label: cur.label,
+              message: `信任锚名称 “${cur.issuer.str}” 与签发者标识不匹配，链路无法到达信任锚`,
+            });
+          }
+          return;
+        }
       }
-      const issuerKey = cur.authorityKeyIdentifier
-        ? `${issKey}|${toHex(cur.authorityKeyIdentifier)}`
-        : null;
-      const issuers = cur.authorityKeyIdentifierPresent
-        ? (bySubjectKeyId.get(issuerKey) || [])
-        : (bySubject.get(issKey) || []);
-      if (issuers.length === 0) {
-        const akiDetail = cur.authorityKeyIdentifierPresent
-          ? '，AuthorityKeyIdentifier 未匹配到候选签发者'
-          : '';
+      const issuers = matches.filter((c) => c !== anchor);
+      if (issuers.length === 0 && issKey !== anchorKey) {
         buildErrors.push({
           stage: 'chain', label: cur.label,
-          message: `找不到 “${cur.issuer.str}” 的签发者证书${akiDetail}，链路无法到达信任锚`,
+          message: `找不到 “${cur.issuer.str}” 的签发者证书${issuerMismatchDetail(cur)}，链路无法到达信任锚`,
         });
         return;
       }

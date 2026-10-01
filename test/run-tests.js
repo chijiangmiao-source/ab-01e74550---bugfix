@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { verifyChainSet, hostMatch, dnsWithin } from '../src/chain.js';
 import { derEcdsaToRaw } from '../src/der.js';
-import { makeCert, makeKeys, extn, OCT, SEQ } from './certgen.js';
+import { makeCert, makeKeys, extn, OCT, SEQ, keyIdFromPublic } from './certgen.js';
 
 const T = Date.parse('2026-10-01T12:00:00Z'); // 验证时刻（有效期内）
 const NB = new Date('2026-01-01T00:00:00Z');
@@ -359,6 +359,177 @@ const run = (anchor, certs, dns = 'app.example.com', at = T) =>
   const atNotAfter = await run(w.anchor, [w.leaf, w.inter], 'app.example.com', NA.getTime());
   ok('场景21：验证时刻取 notAfter 端点 → 成立', assertOk(atNotAfter, '边界') === true,
     atNotAfter.ok ? '' : atNotAfter.message);
+}
+
+// ---------- 场景 22：AKI 采用签发者名称+序列号（而非密钥标识） ----------
+// 构造 ground.example.com 叶 → 中间 CA → 信任锚；各级 AKI 仅携带名称与序列号。
+function buildNamedAkiWorld({ rootOverride = {}, interOverride = {}, leafOverride = {} } = {}) {
+  const rootK = makeKeys();
+  const interK = makeKeys();
+  const leafK = makeKeys();
+  const anchor = makeCert({
+    subjectCN: 'Ground Root CA', issuerCN: 'Ground Root CA',
+    subjectPubKey: rootK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, keyUsage: { keyCertSign: true, crlSign: true },
+    serial: 600, notBefore: NB, notAfter: NA, ...rootOverride,
+  });
+  const inter = makeCert({
+    subjectCN: 'Ground Inter CA', issuerCN: 'Ground Root CA',
+    subjectPubKey: interK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, pathLen: 0, keyUsage: { keyCertSign: true },
+    serial: 601, notBefore: NB, notAfter: NA,
+    aki: { issuerCN: 'Ground Root CA', serial: 600 },
+    ...interOverride,
+  });
+  const leaf = makeCert({
+    subjectCN: 'ground.example.com', issuerCN: 'Ground Inter CA',
+    subjectPubKey: leafK.publicKey, issuerPrivKey: interK.privateKey,
+    keyUsage: { digitalSignature: true }, sanDns: ['ground.example.com'],
+    serial: 602, notBefore: NB, notAfter: NA,
+    aki: { issuerCN: 'Ground Inter CA', serial: 601 },
+    ...leafOverride,
+  });
+  return { anchor, inter, leaf, rootK, interK, leafK };
+}
+
+{
+  const w = buildNamedAkiWorld();
+  const res = await run(w.anchor, [w.leaf, w.inter], 'ground.example.com');
+  ok('场景22a：名称+序列号 AKI 三级链成功',
+    assertOk(res, '名称序列号链') === true, res.ok ? '' : `[${res.stage}] ${res.message}`);
+  if (res.ok) {
+    const order = res.chain.length === 3
+      && res.chain[0].subject === 'CN=ground.example.com'
+      && res.chain[1].subject === 'CN=Ground Inter CA'
+      && res.chain[2].subject === 'CN=Ground Root CA'
+      && res.chain[2].isAnchor && !res.chain[0].isAnchor;
+    ok('场景22b：链级顺序 叶→中间→锚', order);
+    const basis = order && res.chain.slice(0, 2).every((c, i) =>
+      c.notes.some((n) => n.includes('签发者名称+序列号'))
+      && c.notes.some((n) => n.includes('签名') && n.includes('验证通过'))
+      && c.notes.some((n) => n.includes(`L${i + 1}`)));
+    ok('场景22c：逐级依据保留 AKI 名称序列号匹配与签名核验', basis);
+  }
+}
+
+// ---------- 场景 23：AKI 序列号不匹配 → 拒绝（不得误接受） ----------
+{
+  const w = buildNamedAkiWorld({ leafOverride: { aki: { issuerCN: 'Ground Inter CA', serial: 999 } } });
+  const res = await run(w.anchor, [w.leaf, w.inter], 'ground.example.com');
+  ok('场景23：叶 AKI 序列号不匹配 → 拒绝(chain)',
+    assertFail(res, 'chain', 'AKI 序列号不匹配') === true,
+    res.ok ? '意外成功' : `[${res.stage}] ${res.message}`);
+
+  const w2 = buildNamedAkiWorld({ interOverride: { aki: { issuerCN: 'Ground Root CA', serial: 999 } } });
+  const res2 = await run(w2.anchor, [w2.leaf, w2.inter], 'ground.example.com');
+  ok('场景23b：中间 CA 的 AKI 序列号不匹配信任锚 → 拒绝(chain)',
+    assertFail(res2, 'chain', 'AKI 序列号不匹配锚') === true,
+    res2.ok ? '意外成功' : `[${res2.stage}] ${res2.message}`);
+}
+
+// ---------- 场景 24：AKI 签发者名称不匹配 → 拒绝 ----------
+{
+  const w = buildNamedAkiWorld({ leafOverride: { aki: { issuerCN: 'Some Other CA', serial: 601 } } });
+  const res = await run(w.anchor, [w.leaf, w.inter], 'ground.example.com');
+  ok('场景24：叶 AKI 签发者名称不匹配 → 拒绝(chain)',
+    assertFail(res, 'chain', 'AKI 名称不匹配') === true,
+    res.ok ? '意外成功' : `[${res.stage}] ${res.message}`);
+}
+
+// ---------- 场景 25：密钥标识（keyIdentifier）链仍稳定定位正确签发者 ----------
+{
+  const rootK = makeKeys();
+  const interK = makeKeys();
+  const leafK = makeKeys();
+  const anchor = makeCert({
+    subjectCN: 'KID Root CA', issuerCN: 'KID Root CA',
+    subjectPubKey: rootK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, keyUsage: { keyCertSign: true }, serial: 700,
+    subjectKeyId: keyIdFromPublic(rootK.publicKey),
+    notBefore: NB, notAfter: NA,
+  });
+  const inter = makeCert({
+    subjectCN: 'KID Inter CA', issuerCN: 'KID Root CA',
+    subjectPubKey: interK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, pathLen: 0, keyUsage: { keyCertSign: true }, serial: 701,
+    subjectKeyId: keyIdFromPublic(interK.publicKey),
+    aki: { keyId: keyIdFromPublic(rootK.publicKey) },
+    notBefore: NB, notAfter: NA,
+  });
+  const leaf = makeCert({
+    subjectCN: 'ground.example.com', issuerCN: 'KID Inter CA',
+    subjectPubKey: leafK.publicKey, issuerPrivKey: interK.privateKey,
+    keyUsage: { digitalSignature: true }, sanDns: ['ground.example.com'], serial: 702,
+    aki: { keyId: keyIdFromPublic(interK.publicKey) },
+    notBefore: NB, notAfter: NA,
+  });
+  const res1 = await run(anchor, [leaf, inter], 'ground.example.com');
+  ok('场景25a：keyIdentifier AKI 三级链成功（输入乱序）',
+    assertOk(res1, '密钥标识链') === true, res1.ok ? '' : `[${res1.stage}] ${res1.message}`);
+  const res2 = await run(anchor, [inter, leaf], 'ground.example.com');
+  ok('场景25b：keyIdentifier AKI 链顺序无关',
+    assertOk(res2, '密钥标识链乱序') === true, res2.ok ? '' : `[${res2.stage}] ${res2.message}`);
+
+  // 错误的 keyIdentifier（同名但无对应 SKI）→ 拒绝
+  const badLeaf = makeCert({
+    subjectCN: 'ground.example.com', issuerCN: 'KID Inter CA',
+    subjectPubKey: leafK.publicKey, issuerPrivKey: interK.privateKey,
+    keyUsage: { digitalSignature: true }, sanDns: ['ground.example.com'], serial: 703,
+    aki: { keyId: new Uint8Array(20).fill(0xee) },
+    notBefore: NB, notAfter: NA,
+  });
+  const res3 = await run(anchor, [badLeaf, inter], 'ground.example.com');
+  ok('场景25c：keyIdentifier 不匹配 → 拒绝(chain)',
+    assertFail(res3, 'chain', 'keyIdentifier 不匹配') === true,
+    res3.ok ? '意外成功' : `[${res3.stage}] ${res3.message}`);
+}
+
+// ---------- 场景 26：无签发者标识扩展时，同名候选中依签名构造有效链 ----------
+{
+  const rootK = makeKeys();
+  // 两张同名中间 CA：only RealCA 实际签发了叶证书；两张证书均不携带 AKI/SKI。
+  const realK = makeKeys();
+  const fakeK = makeKeys();
+  const anchor = makeCert({
+    subjectCN: 'Twin Root CA', issuerCN: 'Twin Root CA',
+    subjectPubKey: rootK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, keyUsage: { keyCertSign: true }, serial: 800,
+    notBefore: NB, notAfter: NA,
+  });
+  const realInter = makeCert({
+    subjectCN: 'Twin Inter CA', issuerCN: 'Twin Root CA',
+    subjectPubKey: realK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, pathLen: 0, keyUsage: { keyCertSign: true }, serial: 801,
+    notBefore: NB, notAfter: NA,
+  });
+  const fakeInter = makeCert({
+    subjectCN: 'Twin Inter CA', issuerCN: 'Twin Root CA',
+    subjectPubKey: fakeK.publicKey, issuerPrivKey: rootK.privateKey,
+    isCA: true, pathLen: 0, keyUsage: { keyCertSign: true }, serial: 802,
+    notBefore: NB, notAfter: NA,
+  });
+  const leafK = makeKeys();
+  const leaf = makeCert({
+    subjectCN: 'ground.example.com', issuerCN: 'Twin Inter CA',
+    subjectPubKey: leafK.publicKey, issuerPrivKey: realK.privateKey,
+    keyUsage: { digitalSignature: true }, sanDns: ['ground.example.com'], serial: 803,
+    notBefore: NB, notAfter: NA,
+  });
+  const dReal = createHash('sha256').update(realInter).digest('hex');
+  const res1 = await run(anchor, [leaf, realInter, fakeInter], 'ground.example.com');
+  ok('场景26a：无 AKI 时同名候选依签名选出真实签发者',
+    res1.ok && res1.chain[1].sha256 === dReal,
+    res1.ok ? `实际选中 ${res1.chain[1].sha256}` : `[${res1.stage}] ${res1.message}`);
+  const res2 = await run(anchor, [leaf, fakeInter, realInter], 'ground.example.com');
+  ok('场景26b：同名候选稳定选择与输入顺序无关',
+    res2.ok && res2.chain[1].sha256 === dReal,
+    res2.ok ? `实际选中 ${res2.chain[1].sha256}` : `[${res2.stage}] ${res2.message}`);
+
+  // 同名候选都不能验证签名（仅提供 fakeInter）→ signature 失败
+  const res3 = await run(anchor, [leaf, fakeInter], 'ground.example.com');
+  ok('场景26c：同名候选均无有效签名 → 拒绝(signature)',
+    assertFail(res3, 'signature', '同名假签发者') === true && res3.level === 0,
+    res3.ok ? '意外成功' : `[${res3.stage}] ${res3.message}`);
 }
 
 console.log(`\n${passed} 项通过，${failed} 项失败`);

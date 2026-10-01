@@ -13,6 +13,10 @@
   签名、有效期、CA 与 keyUsage（keyCertSign）、pathLenConstraint，
   以及自顶向下**累积的 DNS permitted / excluded 名称约束**（RFC 5280 语义：
   `example.com` 覆盖本身与子域，`.example.com` 仅覆盖子域）。
+- 签发者定位遵循 RFC 5280 §4.2.1.1：签发者名称始终必须匹配；
+  AuthorityKeyIdentifier 携带的 **keyIdentifier**、**签发者名称（directoryName）+
+  序列号**都会作为硬性标识逐一对齐（信任锚同样参与对齐）；
+  无签发者标识扩展时，则在同名候选中以逐级签名核验确定有效链。
 - 多条链成立时，按各级证书 **SHA-256 摘要字典序**（叶→锚）稳定选出一条，并展示逐级依据。
 - 截断 DER、未知关键扩展、循环签发、主机名未列入 SAN、任何约束违约，
   都会定位**首个失败环节**（阶段 / 级别 / 证书标签），并清除旧成功结论。

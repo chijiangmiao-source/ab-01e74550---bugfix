@@ -124,25 +124,47 @@ function parseNameConstraints(bytes) {
   return { permitted, excluded };
 }
 
+// AuthorityKeyIdentifier ::= SEQUENCE {
+//   keyIdentifier             [0] KeyIdentifier            OPTIONAL,
+//   authorityCertIssuer       [1] GeneralNames             OPTIONAL,
+//   authorityCertSerialNumber [2] CertificateSerialNumber  OPTIONAL }
+// 返回 { keyIdentifier, issuerNames(Name DER 列表), serial(INTEGER 内容字节) }。
 function parseAuthorityKeyIdentifier(bytes) {
   const el = readElement(bytes, 0);
   expect(el, 0, 16, 'AuthorityKeyIdentifier SEQUENCE');
   if (el.next !== bytes.length) throw new DerError('AuthorityKeyIdentifier 存在尾随字节');
-  let keyId = null;
+  const aki = { keyIdentifier: null, issuerNames: [], serial: null };
   for (const field of children(el)) {
     if (field.tagClass !== 2) throw new DerError('AuthorityKeyIdentifier 含未知字段');
     if (field.tag === 0) {
-      if (keyId !== null || field.value.length === 0) {
+      if (aki.keyIdentifier !== null || field.value.length === 0) {
         throw new DerError('AuthorityKeyIdentifier 的 keyIdentifier 非法');
       }
-      keyId = field.value.slice();
+      aki.keyIdentifier = field.value.slice(); // [0] IMPLICIT OCTET STRING
       continue;
     }
-    if (field.tag !== 1 && field.tag !== 2) {
-      throw new DerError('AuthorityKeyIdentifier 含未知字段');
+    if (field.tag === 1) {
+      // [1] IMPLICIT GeneralNames —— 仅提取 directoryName [4] EXPLICIT Name
+      for (const gn of children(field)) {
+        if (gn.tagClass === 2 && gn.tag === 4) {
+          const name = readElement(gn.value, 0);
+          expect(name, 0, 16, 'AKI directoryName Name');
+          aki.issuerNames.push(name.raw);
+        }
+        // 其它 GeneralName 形式（rfc822 / DNS / URI 等）与证书主体名称不可比，忽略
+      }
+      continue;
     }
+    if (field.tag === 2) {
+      if (aki.serial !== null || field.value.length === 0) {
+        throw new DerError('AuthorityKeyIdentifier 的 authorityCertSerialNumber 非法');
+      }
+      aki.serial = field.value.slice(); // [2] IMPLICIT INTEGER 内容字节
+      continue;
+    }
+    throw new DerError('AuthorityKeyIdentifier 含未知字段');
   }
-  return keyId;
+  return aki;
 }
 
 function parseSubjectKeyIdentifier(bytes) {
@@ -161,7 +183,7 @@ function parseExtensions(el) {
     san: null,              // {dns: [], critical}
     nameConstraints: null,  // {permitted: [], excluded: [], critical}
     subjectKeyIdentifier: null,
-    authorityKeyIdentifier: null,
+    authorityKeyIdentifier: null, // {keyIdentifier, issuerNames, serial} 或 null
     authorityKeyIdentifierPresent: false,
     unknownCritical: [],
   };

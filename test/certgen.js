@@ -1,6 +1,6 @@
 // certgen.js — 测试夹具：最小 DER 编码器 + P-256 ECDSA/SHA-256 证书构造器。
 // 仅用于测试，生成与被测解析器/验证器相对应的真实签名证书。
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 
 // ---------- DER 编码 ----------
 
@@ -64,6 +64,43 @@ export const BOOL = (v) => tlv(0x01, Uint8Array.of(v ? 0xff : 0x00));
 export const OCT = (bytes) => tlv(0x04, bytes);
 export const BITS = (bytes, unused = 0) => tlv(0x03, Uint8Array.of(unused), bytes);
 
+// 非负整数的 DER INTEGER 内容字节（含必要的 0x00 符号填充），与 INT() 保持一致。
+export function intContent(n) {
+  const b = [];
+  let x = n;
+  if (x === 0) b.push(0);
+  while (x > 0) {
+    b.unshift(x & 0xff);
+    x = Math.floor(x / 256);
+  }
+  if (b[0] & 0x80) b.unshift(0);
+  return Uint8Array.from(b);
+}
+
+// RFC 5280 §4.2.1.2 方法 1：keyIdentifier = BIT STRING subjectPublicKey 的 SHA-1。
+export function keyIdFromPublic(publicKey) {
+  const spki = new Uint8Array(publicKey.export({ format: 'der', type: 'spki' }));
+  const point = spki.subarray(spki.length - 65); // P-256 未压缩点恰为末尾 65 字节
+  return new Uint8Array(createHash('sha1').update(point).digest());
+}
+
+// SubjectKeyIdentifier 扩展（OCTET STRING 内嵌 keyIdentifier OCTET STRING）。
+export function skiExt(keyId) {
+  return extn('2.5.29.14', false, OCT(keyId));
+}
+
+// AuthorityKeyIdentifier 扩展：
+//   keyId 非空 → [0] keyIdentifier；
+//   issuerCN 非空 → [1] EXPLICIT GeneralNames { [4] EXPLICIT directoryName }；
+//   serial 非 null → [2] IMPLICIT authorityCertSerialNumber。
+export function akiExt({ keyId = null, issuerCN = null, serial = null } = {}) {
+  const parts = [];
+  if (keyId) parts.push(tlv(0x80, keyId));
+  if (issuerCN) parts.push(tlv(0xa1, tlv(0xa4, NAME(issuerCN)))); // [1] IMPLICIT GeneralNames { [4] EXPLICIT directoryName }
+  if (serial !== null) parts.push(tlv(0xa2, intContent(serial)));
+  return extn('2.5.29.35', false, SEQ(...parts));
+}
+
 const te = new TextEncoder();
 export const UTF8 = (s) => tlv(0x0c, te.encode(s));
 export const EXPL = (n, ...c) => tlv(0xa0 + n, ...c);
@@ -115,6 +152,8 @@ export function makeCert(opts) {
     notAfter = new Date('2027-01-01T00:00:00Z'),
     serial = 1,
     extraExtensions = [],
+    subjectKeyId = null, // 非 null 时追加 SubjectKeyIdentifier（字节）
+    aki = null,          // {keyId?, issuerCN?, serial?}，非 null 时追加 AuthorityKeyIdentifier
     tamperSig = false,
   } = opts;
 
@@ -138,6 +177,8 @@ export function makeCert(opts) {
     }
     exts.push(extn('2.5.29.30', true, SEQ(...nc)));
   }
+  if (subjectKeyId) exts.push(skiExt(subjectKeyId));
+  if (aki) exts.push(akiExt(aki));
   exts.push(...extraExtensions);
 
   const tbs = SEQ(
